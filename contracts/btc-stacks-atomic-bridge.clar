@@ -33,15 +33,24 @@
 (define-constant ERROR-INVALID-TX-HASH u1010)
 (define-constant ERROR-INVALID-SIGNATURE-FORMAT u1011)
 
-;; Constants
-(define-constant CONTRACT-DEPLOYER tx-sender)
-(define-constant MIN-DEPOSIT-AMOUNT u100000)
-(define-constant MAX-DEPOSIT-AMOUNT u1000000000)
-(define-constant REQUIRED-CONFIRMATIONS u6)
+;; SECURITY CONSTANTS
+(define-constant CONTRACT-DEPLOYER tx-sender)  ;; Immutable admin for emergency controls
+(define-constant MIN-DEPOSIT-AMOUNT u100000)   ;; 0.001 BTC equivalent (1:1e8 satoshi ratio)
+(define-constant MAX_DEPOSIT_AMOUNT u1000000000) ;; 10 BTC equivalent
+(define-constant VALIDATOR_QUORUM u5)          ;; Multi-sig threshold for cross-chain operations
+(define-constant REQUIRED_CONFIRMATIONS u6)    ;; Bitcoin network finality depth
 
-;; data vars
+
+;; STATE MANAGEMENT
+
+;; Bridge operational state (pausable by deployer)
+(define-data-var bridge-active bool true)
+
+;; Cross-chain asset tracking
+(define-data-var total-bridged uint u0)
+(define-data-var last-bitcoin-block uint u0)  ;; Tracks BTC block height
+
 (define-data-var bridge-paused bool false)
-(define-data-var total-bridged-amount uint u0)
 (define-data-var last-processed-height uint u0)
 
 ;; Bitcoin -- Stacks deposit proofs
@@ -128,6 +137,58 @@
         (map-set validators validator false)
         (ok true)
     )
+)
+
+;; Bitcoin -- Stacks deposit initiation (SPV proof submission)
+(define-public (lock-btc 
+    (btc-txid (buff 32)) 
+    (amount uint)
+    (recipient principal)
+    (merkle-proof (buff 256))
+    (btc-sender (buff 33))
+  )
+  (let (
+    (current-balance (get-balance recipient))
+  )
+    (asserts! (var-get bridge-active) (err ERR_BRIDGE_LOCKED))
+    (asserts! (validate-spv-proof btc-txid merkle-proof) (err ERR_SIG_VALIDATION))
+    (asserts! (is-valid-principal recipient) (err ERR_INVALID_STX_ADDR))
+    
+    (map-set deposits { btc-txid: btc-txid } 
+      { 
+        amount: amount,
+        recipient: recipient,
+        confirmations: u0,
+        locktime: block-height,
+        btc-sender: btc-sender
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Stacks -- Bitcoin withdrawal preparation
+(define-public (burn-xbtc 
+    (amount uint) 
+    (btc-recipient (buff 34)) 
+    (memo (buff 128))
+  )
+  (let (
+    (xbtc-balance (contract-call? .xbtc-token get-balance tx-sender))
+  )
+    (asserts! (>= xbtc-balance amount) (err ERR_INSUFFICIENT_FUNDS))
+    (contract-call? .xbtc-token transfer amount tx-sender (as-contract tx-sender))
+    
+    (map-set withdrawals { nonce: (+ (map-len withdrawals) u1) }
+      { 
+        amount: amount,
+        btc-recipient: btc-recipient,
+        stx-sender: tx-sender,
+        burn-proof: (hash160 memo)
+      }
+    )
+    (ok true)
+  )
 )
 
 ;; Initiates a deposit into the bridge. Validators must call this function.
@@ -261,6 +322,14 @@
             (ok true)
         )
     )
+)
+
+(define-public (toggle-bridge-state (new-state bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-DEPLOYER) (err ERR_UNAUTHORIZED))
+    (var-set bridge-active new-state)
+    (ok true)
+  )
 )
 
 ;; read only functions
